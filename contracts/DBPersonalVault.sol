@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// DegenBlue Contracts v0.0.1 (contracts/DBPersonalVault.sol)
+// DegenBlue Contracts v0.0.2 (contracts/DBPersonalVault.sol)
 
 pragma solidity ^0.8.0;
 
@@ -16,9 +16,9 @@ import "../interfaces/IwMEMO.sol";
 /**
  *  @title DBPersonalVault
  *  @author pbnather
- *  @dev This contract is an implemention for the proxy persoanl vaults for 'hyperbinding' in ohm-forks.
+ *  @dev This contract is an implemention for the proxy personal vaults for (4,4) strategy in ohm-forks.
  *
- *  User, aka `depositor`, despostis TIME or MEMO to the contract, which can be managed by `manager` address.
+ *  User, aka `depositor`, deposits TIME or MEMO to the contract, which can be managed by a `manager` address.
  *  If estimated bond 5-day ROI is better than staking 5-day ROI, manager can create a bond.
  *  Estimated 5-day ROI assumes that claimable bond rewards are redeemed close to, but before, each TIME rebase.
  *
@@ -48,8 +48,8 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
     IBondingHQ public bondingHQ; // Bonding HQ
 
     address public manager; // Address which can manage bonds
-    address public admin; // Address to send fees
-    address public feeHarvester;
+    address public admin; // Admin address
+    address public feeHarvester; // Address to send fees to
     uint256 public fee; // Fee taken from each redeem
     uint256 public minimumBondDiscount; // 1% = 100
     bool public isManaged; // If vault is in managed mode
@@ -227,12 +227,21 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
 
     /* ======== USER FUNCTIONS ======== */
 
+    /**
+     *  @dev Set MANAGED mode (true), or MANUAL mode (false).
+     */
     function setManaged(bool _managed) external override onlyOwner {
         require(isManaged != _managed, "Cannot set mode to current mode");
         isManaged = _managed;
         emit ManagedChanged(_managed);
     }
 
+    /**
+     *  @dev Set minimum bonding discount. If bonded ROI is less than the set minimum discount,
+     *  bond won't be created and transcation will revert.
+     *
+     *  @param _discount bonding discount percentage (1% = 100)
+     */
     function setMinimumBondingDiscount(uint256 _discount)
         external
         override
@@ -277,7 +286,7 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
             bondingHQ.depositoryExists(_depository, false),
             "Depository doesn't exist or is inactive"
         );
-        _redeemBondFrom(ITimeBondDepository(_depository));
+        _redeemBondFrom(ITimeBondDepository(_depository), true);
     }
 
     /**
@@ -285,14 +294,15 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
      */
     function redeemAllBonds() external override {
         for (uint256 i = 0; i < activeBonds.length; i++) {
-            _redeemBondFrom(ITimeBondDepository(activeBonds[i]));
+            _redeemBondFrom(ITimeBondDepository(activeBonds[i]), false);
         }
+        _removeAllFinishedBonds();
     }
 
     /* ======== VIEW FUNCTIONS ======== */
 
     /**
-     *  @dev this function checks if taken bond is profitable after fees.
+     *  @dev This function checks if taken bond is profitable after fees.
      *  It estimates using precomputed magic number what's the minimum viable 5-day ROI
      *  (assmuing redeemeing before all the rebases), versus staking MEMO.
      *  It also checks if minimum bonding discount set by the user is reached.
@@ -302,6 +312,7 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         view
         returns (bool _profitable)
     {
+        require(_payout > _bonded, "Bond cannot have negative ROI");
         uint256 bondingROI = ((10000 * _payout) / _bonded) - 10000; // 1% = 100
         require(
             bondingROI >= minimumBondDiscount,
@@ -314,6 +325,10 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         uint256 magicNumber = 2 * (60 + (stakingROI / 100));
         uint256 minimumBonding = (100 * stakingROI) / magicNumber;
         _profitable = bondingROI >= minimumBonding;
+    }
+
+    function getActiveBondsLength() public view override returns (uint256) {
+        return activeBonds.length;
     }
 
     function getBondedFunds() public view override returns (uint256 _funds) {
@@ -418,17 +433,16 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         uint256 lpAmount = _lpToken.balanceOf(address(this));
         uint256 payout = _bondWith(_lpToken, lpAmount, _depository);
         require(
-            isBondProfitable(amount - usedAsset, payout),
+            isBondProfitable(_amount - usedAsset, payout),
             "Bonding rate worse than staking"
         );
-        _addBondInfo(address(_depository), payout, amount - usedAsset);
-        emit BondCreated(amount - usedAsset, address(_lpToken), payout);
+        _addBondInfo(address(_depository), payout, _amount - usedAsset);
+        emit BondCreated(_amount - usedAsset, address(_lpToken), payout);
         return payout;
     }
 
     /**
-     *  @dev This function swaps assets for sepcified token via TraderJoe.
-     *  @notice Slippage cannot exceed 1.5%.
+     *  @dev This function swaps {@param _asset} for sepcified {@param _token} via {@param _router}.
      */
     function _sellAssetFor(
         IERC20 _asset,
@@ -455,8 +469,8 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
     }
 
     /**
-     *  @dev This function adds liquidity for specified tokens on TraderJoe.
-     *  @notice This function tries to maximize usage of first token {_tokenA}.
+     *  @dev This function adds liquidity for specified tokens via dex {@param _router}.
+     *  @notice This function tries to maximize usage of first token {@param _tokenA}.
      */
     function _addLiquidityFor(
         IERC20 _tokenA,
@@ -481,7 +495,7 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
     }
 
     /**
-     * @dev This function adds liquidity for specified tokens on TraderJoe.
+     * @dev This function mints a bond with a {@param _token}, using bond {@param _depository}.
      */
     function _bondWith(
         IERC20 _token,
@@ -497,7 +511,7 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         _payout = _depository.deposit(_amount, maxBondPrice, address(this));
     }
 
-    function _redeemBondFrom(ITimeBondDepository _depository)
+    function _redeemBondFrom(ITimeBondDepository _depository, bool _delete)
         internal
         returns (uint256)
     {
@@ -508,7 +522,7 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         uint256 feeValue = (amount * fee) / 10000;
         uint256 redeemed = amount - feeValue;
         bonds[address(_depository)].payout -= amount;
-        if (block.timestamp >= bonds[address(_depository)].vestingEndTime) {
+        if (_delete && bonds[address(_depository)].payout == 0) {
             _removeBondInfo(address(_depository));
         }
         stakedAsset.safeTransfer(feeHarvester, feeValue);
@@ -534,13 +548,14 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
             payout: bonds[address(_depository)].payout + _payout,
             assetUsed: bonds[address(_depository)].assetUsed + _assetsUsed,
             vestingEndTime: block.timestamp + 5 days,
-            maturing: 0 // not used yet
+            maturing: bonds[address(_depository)].maturing + _payout
         });
     }
 
     function _removeBondInfo(address _depository) internal {
-        require(bonds[address(_depository)].vestingEndTime >= block.timestamp);
         bonds[address(_depository)].payout = 0;
+        bonds[address(_depository)].maturing = 0;
+        bonds[address(_depository)].assetUsed = 0;
         for (uint256 i = 0; i < activeBonds.length; i++) {
             if (activeBonds[i] == _depository) {
                 activeBonds[i] = activeBonds[activeBonds.length - 1];
@@ -550,10 +565,25 @@ contract DBPersonalVault is Initializable, Ownable, IPersonalVault {
         }
     }
 
+    function _removeAllFinishedBonds() internal {
+        uint256 length = activeBonds.length;
+        uint256 checked = 0;
+        uint256 index = length - 1;
+        while (checked != length) {
+            if (bonds[activeBonds[index]].payout == 0) {
+                _removeBondInfo(activeBonds[index]);
+            }
+            checked += 1;
+            if (index != 0) {
+                index -= 1;
+            }
+        }
+    }
+
     /* ======== AUXILLIARY ======== */
 
     /**
-     *  @notice allow anyone to send lost tokens (stakedAsset) to the vault owner
+     *  @notice allow anyone to send lost tokens (stakedAsset) to the vault owner.
      *  @return bool
      */
     function recoverLostToken(IERC20 _token) external returns (bool) {
